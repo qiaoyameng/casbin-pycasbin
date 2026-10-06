@@ -539,6 +539,22 @@ class CoreEnforcer:
             results.append(result)
         return results
 
+    def compile_filter(self, **fixed):
+        """compiles the matcher into a filter expression tree over the request
+        tokens that are not fixed, so a data layer can pre-filter resources
+        instead of enforcing one by one.
+
+        Pass fixed request values by token name, e.g.
+        ``e.compile_filter(sub="alice", act="read")`` leaves ``obj`` symbolic.
+        The returned tree encodes the model's policy effect (deny rules
+        included) and can be evaluated with ``casbin.filter_compiler.interpret``
+        or translated by a data layer. Raises ``filter_compiler.CompileError``
+        when a construct cannot be symbolized.
+        """
+        from casbin.filter_compiler import compile_filter
+
+        return compile_filter(self, fixed)
+
     @staticmethod
     def configure_logging(logging_config=None):
         """configure_logging configure the default logger for casbin"""
