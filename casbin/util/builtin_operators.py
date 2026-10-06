@@ -385,6 +385,28 @@ def generate_conditional_g_function(crm):
     return conditional_g_function
 
 
+def generate_temporal_g_function(crm, time):
+    """the factory method of the g(_, _[, _]) function evaluated at a fixed moment.
+
+    Only role links whose validity interval contains "time" are traversable.
+    """
+
+    def temporal_g_function(*args):
+        name1, name2 = args[0], args[1]
+
+        if crm is None:
+            has_link = name1 == name2
+        elif len(args) == 2:
+            has_link = crm.has_link_at(time, name1, name2)
+        else:
+            domain = str(args[2])
+            has_link = crm.has_link_at(time, name1, name2, domain)
+
+        return has_link
+
+    return temporal_g_function
+
+
 def time_match_func(*args):
     """the wrapper for TimeMatch."""
     if len(args) != 2:

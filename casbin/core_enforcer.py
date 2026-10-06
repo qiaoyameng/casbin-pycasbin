@@ -21,7 +21,16 @@ from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
-from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
+from casbin.util import (
+    generate_g_function,
+    SimpleEval,
+    util,
+    generate_conditional_g_function,
+    generate_temporal_g_function,
+    merge_intervals,
+    parse_required_time,
+    parse_validity_interval,
+)
 from casbin.util.log import configure_logging, disabled_logging
 
 
@@ -53,6 +62,7 @@ class CoreEnforcer:
     watcher = None
     rm_map = None
     cond_rm_map = None
+    policy_validity_map = None
 
     enabled = False
     auto_save = False
@@ -111,6 +121,7 @@ class CoreEnforcer:
     def _initialize(self):
         self.rm_map = dict()
         self.cond_rm_map = dict()
+        self.policy_validity_map = dict()
         self.eft = get_effector(self.model["e"]["e"].value)
         self.watcher = None
 
@@ -375,6 +386,62 @@ class CoreEnforcer:
             return True
         return False
 
+    def add_named_link_validity_interval(self, ptype, user, role, start, end):
+        """Attaches a half-open validity interval [start, end) to the link user->role.
+        start and end must be timezone-aware absolute moments (datetime objects or
+        ISO 8601 strings); None or "_" leaves an end unbounded. The link is only
+        traversable while the evaluation moment lies inside the interval."""
+        if ptype in self.cond_rm_map:
+            start, end = parse_validity_interval(start, end)
+            rm = self.cond_rm_map[ptype]
+            rm.add_link_validity_interval(user, role, start, end)
+            return True
+        return False
+
+    def add_named_domain_link_validity_interval(self, ptype, user, role, domain, start, end):
+        """Attaches a half-open validity interval [start, end) to the link user->{role, domain}."""
+        if ptype in self.cond_rm_map:
+            start, end = parse_validity_interval(start, end)
+            rm = self.cond_rm_map[ptype]
+            rm.add_domain_link_validity_interval(user, role, domain, start, end)
+            return True
+        return False
+
+    def set_named_policy_validity_interval(self, ptype, rule, start, end):
+        """Attaches a half-open validity interval [start, end) to a policy rule.
+        The rule only participates in enforcement while the evaluation moment lies
+        inside the interval. Passing None for both ends removes the interval."""
+        if "p" not in self.model.keys() or ptype not in self.model["p"].keys():
+            raise ValueError(f"policy definition not found: {ptype}")
+
+        rule = list(rule)
+        if rule not in self.model["p"][ptype].policy:
+            raise ValueError(f"policy rule not found: {rule}")
+
+        key = (ptype, tuple(rule))
+        if start is None and end is None:
+            self.policy_validity_map.pop(key, None)
+        else:
+            self.policy_validity_map[key] = parse_validity_interval(start, end)
+        return True
+
+    def _check_temporal_query_supported(self):
+        """rejects time-based queries when links carry custom condition functions,
+        whose behavior at arbitrary moments cannot be determined."""
+        for crm in self.cond_rm_map.values():
+            if crm.has_link_condition_funcs():
+                raise RuntimeError(
+                    "time-based interval queries do not support custom link condition functions; "
+                    "attach validity intervals to role links instead"
+                )
+
+    def _policy_rule_active_at(self, ptype, pvals, time):
+        interval = self.policy_validity_map.get((ptype, tuple(pvals)))
+        if interval is None:
+            return True
+        start, end = interval
+        return start <= time < end
+
     def new_enforce_context(self, suffix: str) -> EnforceContext:
         return EnforceContext(
             rtype="r" + suffix,
@@ -390,7 +457,66 @@ class CoreEnforcer:
         result, _ = self.enforce_ex(*rvals)
         return result
 
-    def enforce_ex(self, *rvals):
+    def enforce_at(self, moment, *rvals):
+        """decides whether a request is allowed at a specific moment, taking the
+        validity intervals of role links and policy rules into account.
+        moment must be a timezone-aware absolute time (datetime or ISO 8601 string);
+        the machine clock is never read.
+        """
+        time = parse_required_time(moment, "moment")
+        self._check_temporal_query_supported()
+        # Call CoreEnforcer.enforce_ex directly: subclasses such as CachedEnforcer
+        # key their cache on the request alone, which cannot capture eval_time.
+        result, _ = CoreEnforcer.enforce_ex(self, *rvals, eval_time=time)
+        return result
+
+    def get_allowed_intervals(self, window_start, window_end, *rvals):
+        """computes the half-open intervals within [window_start, window_end) during
+        which the request is allowed, honoring the validity intervals attached to
+        role links and policy rules as well as the model's allow/deny effect.
+
+        The result is a sorted, non-overlapping list of (start, end) datetime pairs
+        normalized to UTC. Change points are computed exactly from the interval
+        boundaries; no sampling approximation is used. Custom link condition
+        functions are not supported and cause a RuntimeError.
+        """
+        start = parse_required_time(window_start, "window_start")
+        end = parse_required_time(window_end, "window_end")
+        if end < start:
+            raise ValueError("window_end must not be earlier than window_start")
+        if start == end:
+            return []
+
+        self._check_temporal_query_supported()
+
+        points = {start, end}
+        for crm in self.cond_rm_map.values():
+            for interval_start, interval_end in crm.get_link_validity_intervals():
+                self._add_clipped_change_points(points, interval_start, interval_end, start, end)
+        for interval_start, interval_end in self.policy_validity_map.values():
+            self._add_clipped_change_points(points, interval_start, interval_end, start, end)
+
+        sorted_points = sorted(points)
+        allowed = []
+        for segment_start, segment_end in zip(sorted_points, sorted_points[1:]):
+            if segment_start >= segment_end:
+                continue
+            # The authorization state is constant over each elementary segment, so
+            # evaluating the half-open segment at its start decides the whole segment.
+            if self.enforce_at(segment_start, *rvals):
+                allowed.append((segment_start, segment_end))
+
+        return merge_intervals(allowed)
+
+    @staticmethod
+    def _add_clipped_change_points(points, interval_start, interval_end, window_start, window_end):
+        interval_start = max(interval_start, window_start)
+        interval_end = min(interval_end, window_end)
+        if interval_start <= interval_end:
+            points.add(interval_start)
+            points.add(interval_end)
+
+    def enforce_ex(self, *rvals, eval_time=None):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
         return judge result with reason
@@ -411,7 +537,10 @@ class CoreEnforcer:
                 if len(self.rm_map) != 0:
                     functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
-                    functions[key] = generate_conditional_g_function(ast.cond_rm)
+                    if eval_time is None:
+                        functions[key] = generate_conditional_g_function(ast.cond_rm)
+                    else:
+                        functions[key] = generate_temporal_g_function(ast.cond_rm, eval_time)
 
         if len(rvals) != 0:
             if isinstance(rvals[0], EnforceContext):
@@ -448,6 +577,9 @@ class CoreEnforcer:
         explain_index = -1
         if not 0 == policy_len:
             for i, pvals in enumerate(self.model["p"][ptype].policy):
+                if eval_time is not None and not self._policy_rule_active_at(ptype, pvals, eval_time):
+                    continue
+
                 if len(p_tokens) != len(pvals):
                     raise RuntimeError("invalid policy size")
 

@@ -35,6 +35,7 @@ class Role:
         self.users = set()
         self.link_condition_func_map = dict()
         self.link_condition_func_params_map = dict()
+        self.link_validity_map = dict()
 
     def add_role(self, role):
         self.roles.add(role)
@@ -91,6 +92,13 @@ class Role:
         key = (role.name, domain)
         params = self.link_condition_func_params_map.get(key)
         return list(params) if params is not None else []
+
+    def add_link_validity(self, role, domain, interval):
+        self.link_validity_map[(role.name, domain)] = interval
+
+    def get_link_validity(self, role, domain):
+        key = (role.name, domain)
+        return self.link_validity_map.get(key)
 
 
 class RoleManager(RM):
@@ -465,6 +473,70 @@ class ConditionalRoleManager(RoleManager, CRM):
         role = self._get_role(role_name)
         user.set_link_condition_func_params(role, domain, *params)
 
+    def add_link_validity_interval(self, user_name, role_name, start, end):
+        """adds a half-open validity interval [start, end) to the link userName->roleName"""
+        self.add_domain_link_validity_interval(user_name, role_name, "", start, end)
+
+    def add_domain_link_validity_interval(self, user_name, role_name, domain, start, end):
+        """adds a half-open validity interval [start, end) to the link userName->{roleName, domain}"""
+        user = self._get_role(user_name)
+        role = self._get_role(role_name)
+        user.add_link_validity(role, domain, (start, end))
+
+    def get_link_validity_intervals(self):
+        """returns all validity intervals attached to links of this role manager"""
+        intervals = []
+        for role in self.all_roles.values():
+            intervals.extend(role.link_validity_map.values())
+        return intervals
+
+    def has_link_condition_funcs(self):
+        """returns true if any link carries a custom link condition function"""
+        return any(role.link_condition_func_map for role in self.all_roles.values())
+
+    def has_link_at(self, time, name1, name2, *domains):
+        """determines whether role: name1 inherits role: name2 at the given moment.
+        Only links whose validity interval contains the moment are traversable,
+        so every link along an inheritance path must be valid simultaneously."""
+        if name1 == name2 or (self.matching_func is not None and self._matching_fn(name1, name2)):
+            return True
+
+        user = self._get_role(name1)
+        role = self._get_role(name2)
+
+        return self._has_link_at(time, role.name, [user], self.max_hierarchy_level, *domains)
+
+    def _has_link_at(self, time, target_name, roles, level, *domains):
+        """use the Breadth First Search algorithm to traverse the Role tree at a fixed moment"""
+        if level < 0 or len(roles) == 0:
+            return False
+
+        next_roles = set()
+        for role in roles:
+            if target_name == role.name or (
+                self.matching_func is not None and self._matching_fn(role.name, target_name)
+            ):
+                return True
+
+            for next_role in role.roles:
+                linked_role = self.get_next_roles_at(role, next_role, domains, time)
+                next_roles.update(set(linked_role))
+
+        return self._has_link_at(time, target_name, next_roles, level - 1, *domains)
+
+    def get_next_roles_at(self, current_role, next_role, domains, time):
+        """returns the roles reachable from current_role at the given moment"""
+        domain_name = domains[0] if domains else ""
+        validity = current_role.get_link_validity(next_role, domain_name)
+        if validity is None:
+            return [next_role]
+
+        start, end = validity
+        if start <= time < end:
+            return [next_role]
+
+        return []
+
 
 class ConditionalDomainManager(DomainManager, ConditionalRoleManager):
     def _get_role_manager(self, *domain):
@@ -524,3 +596,25 @@ class ConditionalDomainManager(DomainManager, ConditionalRoleManager):
     def set_domain_link_condition_func_params(self, user_name, role_name, domain, *params):
         for rm in self.rm_map.values():
             rm.set_domain_link_condition_func_params(user_name, role_name, domain, *params)
+
+    def add_link_validity_interval(self, user_name, role_name, start, end):
+        for rm in self.rm_map.values():
+            rm.add_link_validity_interval(user_name, role_name, start, end)
+
+    def add_domain_link_validity_interval(self, user_name, role_name, domain, start, end):
+        for rm in self.rm_map.values():
+            rm.add_domain_link_validity_interval(user_name, role_name, domain, start, end)
+
+    def get_link_validity_intervals(self):
+        intervals = []
+        for rm in self.rm_map.values():
+            intervals.extend(rm.get_link_validity_intervals())
+        return intervals
+
+    def has_link_condition_funcs(self):
+        return any(rm.has_link_condition_funcs() for rm in self.rm_map.values())
+
+    def has_link_at(self, time, name1, name2, *domain):
+        domain = self._get_domain(*domain)
+        rm = self._get_conditional_role_manager(domain)
+        return rm.has_link_at(time, name1, name2, domain)

@@ -14,4 +14,5 @@
 
 from .builtin_operators import *
 from .expression import *
+from .time_interval import *
 from .util import *
