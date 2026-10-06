@@ -23,6 +23,20 @@ from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
 from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
 from casbin.util.log import configure_logging, disabled_logging
+from casbin.decision import (
+    Decision,
+    DecisionEffect,
+    merge_obligations,
+    parse_obligation_definition,
+    split_obligation_value,
+)
+from casbin.constant.constants import (
+    ALLOW_OVERRIDE_EFFECT,
+    DENY_OVERRIDE_EFFECT,
+    ALLOW_AND_DENY_EFFECT,
+    PRIORITY_EFFECT,
+    SUBJECT_PRIORITY_EFFECT,
+)
 
 
 class EnforceContext:
@@ -396,118 +410,20 @@ class CoreEnforcer:
         return judge result with reason
         """
 
-        rtype = "r"
-        ptype = "p"
-        etype = "e"
-        mtype = "m"
-
         if not self.enabled:
             return [True, []]
 
-        functions = self.fm.get_functions()
-
-        if "g" in self.model.keys():
-            for key, ast in self.model["g"].items():
-                if len(self.rm_map) != 0:
-                    functions[key] = generate_g_function(ast.rm)
-                if len(self.cond_rm_map) != 0:
-                    functions[key] = generate_conditional_g_function(ast.cond_rm)
-
-        if len(rvals) != 0:
-            if isinstance(rvals[0], EnforceContext):
-                enforce_context = rvals[0]
-                rtype = enforce_context.rtype
-                ptype = enforce_context.ptype
-                etype = enforce_context.etype
-                mtype = enforce_context.mtype
-                rvals = rvals[1:]
-
-        if "m" not in self.model.keys():
-            raise RuntimeError("model is undefined")
-
-        if "m" not in self.model["m"].keys():
-            raise RuntimeError("model is undefined")
-
+        rvals, rtype, ptype, etype, mtype, functions = self._prepare_enforce(rvals)
         r_tokens = self.model["r"][rtype].tokens
-        p_tokens = self.model["p"][ptype].tokens
 
         if len(r_tokens) != len(rvals):
             raise RuntimeError("invalid request size")
 
-        exp_string = self.model["m"][mtype].value
-        exp_has_eval = util.has_eval(exp_string)
-        if not exp_has_eval:
-            expression = self._get_expression(exp_string, functions)
+        matches = self._match_policies(
+            rvals, rtype, ptype, etype, mtype, functions, stop_on_decisive=True
+        )
 
-        policy_effects = set()
-
-        r_parameters = dict(zip(r_tokens, rvals))
-
-        policy_len = len(self.model["p"][ptype].policy)
-
-        explain_index = -1
-        if not 0 == policy_len:
-            for i, pvals in enumerate(self.model["p"][ptype].policy):
-                if len(p_tokens) != len(pvals):
-                    raise RuntimeError("invalid policy size")
-
-                p_parameters = dict(zip(p_tokens, pvals))
-                parameters = dict(r_parameters, **p_parameters)
-
-                if exp_has_eval:
-                    rule_names = util.get_eval_value(exp_string)
-                    rules = [util.escape_assertion(p_parameters[rule_name]) for rule_name in rule_names]
-                    exp_with_rule = util.replace_eval(exp_string, rules)
-                    expression = self._get_expression(exp_with_rule, functions)
-
-                result = expression.eval(parameters)
-
-                if isinstance(result, bool):
-                    if not result:
-                        policy_effects.add(Effector.INDETERMINATE)
-                        continue
-                elif isinstance(result, float):
-                    if 0 == result:
-                        policy_effects.add(Effector.INDETERMINATE)
-                        continue
-                else:
-                    raise RuntimeError("matcher result should be bool, int or float")
-
-                p_eft_key = ptype + "_eft"
-                if p_eft_key in parameters.keys():
-                    eft = parameters[p_eft_key]
-                    if "allow" == eft:
-                        policy_effects.add(Effector.ALLOW)
-                    elif "deny" == eft:
-                        policy_effects.add(Effector.DENY)
-                    else:
-                        policy_effects.add(Effector.INDETERMINATE)
-                else:
-                    policy_effects.add(Effector.ALLOW)
-
-                # Update explain_index for any matching policy before checking early break condition
-                # to ensure explanations are captured for allow rules in deny models
-                explain_index = i
-
-                if self.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE:
-                    break
-
-        else:
-            if exp_has_eval:
-                raise RuntimeError("please make sure rule exists in policy when using eval() in matcher")
-
-            parameters = r_parameters.copy()
-
-            for token in self.model["p"][ptype].tokens:
-                parameters[token] = ""
-
-            result = expression.eval(parameters)
-
-            if result:
-                policy_effects.add(Effector.ALLOW)
-            else:
-                policy_effects.add(Effector.INDETERMINATE)
-
+        policy_effects = {effect for effect, _ in matches}
         final_effect = self.eft.final_effect(policy_effects)
         result = effect_to_bool(final_effect)
 
@@ -526,8 +442,10 @@ class CoreEnforcer:
                 self.logger.warning(req_str)
 
         explain_rule = []
-        if explain_index != -1 and explain_index < policy_len:
-            explain_rule = self.model["p"][ptype].policy[explain_index]
+        if matches:
+            # Same rule reported historically by enforce_ex: the last matched
+            # rule processed before the effector reached a decisive result.
+            explain_rule = matches[-1][1]
 
         return result, explain_rule
 
@@ -538,6 +456,241 @@ class CoreEnforcer:
             result = self.enforce(*request)
             results.append(result)
         return results
+
+    def decide(self, *rvals):
+        """returns a structured :class:`Decision` for the request.
+
+        In addition to the allow/deny outcome it carries the obligations of
+        the rules eligible to contribute under the active effect model.
+        Obligations are only returned as data; the enforcer never executes
+        them (no audit is sent and no business object is modified). When the
+        obligations cannot be composed without conflict the decision is
+        ``indeterminate`` and not executable, which must not be mistaken for
+        a plain allow.
+        """
+        if not self.enabled:
+            return Decision(effect=DecisionEffect.ALLOW)
+
+        rvals, rtype, ptype, etype, mtype, functions = self._prepare_enforce(rvals)
+        r_tokens = self.model["r"][rtype].tokens
+        p_tokens = self.model["p"][ptype].tokens
+
+        if len(r_tokens) != len(rvals):
+            raise RuntimeError("invalid request size")
+
+        # Every matched rule is needed: obligations must not come from just
+        # the first match, so do not stop on the first decisive intermediate
+        # effect.
+        matches = self._match_policies(
+            rvals, rtype, ptype, etype, mtype, functions, stop_on_decisive=False
+        )
+
+        matched_rules = [pvals for _, pvals in matches]
+        policy_effects = {effect for effect, _ in matches}
+        final_effect = self.eft.final_effect(policy_effects)
+        base_effect = (
+            DecisionEffect.ALLOW if final_effect == Effector.ALLOW else DecisionEffect.DENY
+        )
+
+        obligations, conflicts = {}, []
+        explain_rules = matched_rules
+
+        # The effector is always the model's "e" assertion (see
+        # EnforceContext usage in enforce_ex), so its obligation definition is
+        # "o" regardless of the selected p/m suffix.
+        definition = self._get_obligation_definition("o")
+        if definition:
+            token_index = {token: i for i, token in enumerate(p_tokens)}
+            # A synthetic match produced for policy-less models carries no
+            # rule values and therefore cannot contribute obligations.
+            real_matches = [item for item in matches if item[1]]
+            eligible = self._eligible_obligation_rules("e", real_matches)
+            explain_rules = [pvals for _, pvals in eligible]
+
+            contributions = []
+            for _, pvals in eligible:
+                contribution = {}
+                for name in definition:
+                    token = ptype + "_" + name
+                    index = token_index.get(token)
+                    if index is not None and index < len(pvals):
+                        values = split_obligation_value(pvals[index])
+                        if values:
+                            contribution[name] = values
+                contributions.append(contribution)
+
+            obligations, conflicts = merge_obligations(definition, contributions)
+
+        effect = DecisionEffect.INDETERMINATE if conflicts else base_effect
+        return Decision(
+            effect=effect,
+            obligations=obligations,
+            conflicts=conflicts,
+            explain_rules=explain_rules,
+        )
+
+    def _prepare_enforce(self, rvals):
+        """resolves the request/policy/effect/matcher types and functions."""
+        rtype, ptype, etype, mtype = "r", "p", "e", "m"
+
+        functions = self.fm.get_functions()
+
+        if "g" in self.model.keys():
+            for key, ast in self.model["g"].items():
+                if len(self.rm_map) != 0:
+                    functions[key] = generate_g_function(ast.rm)
+                if len(self.cond_rm_map) != 0:
+                    functions[key] = generate_conditional_g_function(ast.cond_rm)
+
+        if len(rvals) != 0 and isinstance(rvals[0], EnforceContext):
+            enforce_context = rvals[0]
+            rtype = enforce_context.rtype
+            ptype = enforce_context.ptype
+            etype = enforce_context.etype
+            mtype = enforce_context.mtype
+            rvals = rvals[1:]
+
+        if "m" not in self.model.keys() or "m" not in self.model["m"].keys():
+            raise RuntimeError("model is undefined")
+
+        return rvals, rtype, ptype, etype, mtype, functions
+
+    def _match_policies(self, rvals, rtype, ptype, etype, mtype, functions, stop_on_decisive):
+        """evaluates the matcher against every policy rule.
+
+        Returns a list of ``(effect, pvals)`` for matched rules in policy
+        order. ``effect`` is one of ``Effector.ALLOW``/``Effector.DENY``.
+        When ``stop_on_decisive`` is true evaluation stops as soon as the
+        effector reaches a decisive intermediate effect, reproducing the
+        historical enforce_ex traversal (and therefore its explanation).
+        Priority effect models always stop at the first matched rule, because
+        that rule alone decides the request.
+        """
+        r_tokens = self.model["r"][rtype].tokens
+        p_tokens = self.model["p"][ptype].tokens
+        r_parameters = dict(zip(r_tokens, rvals))
+
+        # The active effector is always built from the model's "e" assertion,
+        # even when an EnforceContext selects p2/m2; mirror that here.
+        effector_expr = self.model["e"]["e"].value
+        first_match_decides = effector_expr in (PRIORITY_EFFECT, SUBJECT_PRIORITY_EFFECT)
+
+        exp_string = self.model["m"][mtype].value
+        exp_has_eval = util.has_eval(exp_string)
+        if not exp_has_eval:
+            expression = self._get_expression(exp_string, functions)
+
+        policy_effects = set()
+        matches = []
+
+        if len(self.model["p"][ptype].policy) != 0:
+            for pvals in self.model["p"][ptype].policy:
+                if len(p_tokens) != len(pvals):
+                    raise RuntimeError("invalid policy size")
+
+                p_parameters = dict(zip(p_tokens, pvals))
+                parameters = dict(r_parameters, **p_parameters)
+
+                if exp_has_eval:
+                    rule_names = util.get_eval_value(exp_string)
+                    rules = [util.escape_assertion(p_parameters[rule_name]) for rule_name in rule_names]
+                    exp_with_rule = util.replace_eval(exp_string, rules)
+                    expression = self._get_expression(exp_with_rule, functions)
+
+                matcher_result = expression.eval(parameters)
+
+                if isinstance(matcher_result, bool):
+                    if not matcher_result:
+                        policy_effects.add(Effector.INDETERMINATE)
+                        continue
+                elif isinstance(matcher_result, float):
+                    if 0 == matcher_result:
+                        policy_effects.add(Effector.INDETERMINATE)
+                        continue
+                else:
+                    raise RuntimeError("matcher result should be bool, int or float")
+
+                p_eft_key = ptype + "_eft"
+                if p_eft_key in parameters.keys():
+                    eft = parameters[p_eft_key]
+                    if "allow" == eft:
+                        effect = Effector.ALLOW
+                    elif "deny" == eft:
+                        effect = Effector.DENY
+                    else:
+                        policy_effects.add(Effector.INDETERMINATE)
+                        continue
+                else:
+                    effect = Effector.ALLOW
+
+                policy_effects.add(effect)
+                matches.append((effect, pvals))
+
+                if first_match_decides:
+                    break
+
+                if (
+                    stop_on_decisive
+                    and self.eft.intermediate_effect(policy_effects) != Effector.INDETERMINATE
+                ):
+                    break
+        else:
+            if exp_has_eval:
+                raise RuntimeError("please make sure rule exists in policy when using eval() in matcher")
+
+            parameters = r_parameters.copy()
+            for token in p_tokens:
+                parameters[token] = ""
+
+            matcher_result = expression.eval(parameters)
+            if matcher_result:
+                matches.append((Effector.ALLOW, []))
+            else:
+                policy_effects.add(Effector.INDETERMINATE)
+
+        return matches
+
+    def _get_obligation_definition(self, otype):
+        """returns the parsed name -> operator mapping of the obligation section."""
+        if "o" not in self.model.keys() or otype not in self.model["o"].keys():
+            return {}
+        return parse_obligation_definition(self.model["o"][otype].value)
+
+    def _eligible_obligation_rules(self, etype, matches):
+        """selects the matched rules allowed to contribute obligations.
+
+        Eligibility follows the effect model, never "the first matched rule's
+        extra columns":
+
+        * allow-override: every matched *allow* rule (any allow wins, so only
+          allows determine the granted obligations);
+        * deny-override: every matched *deny* rule; with no deny, every
+          matched allow rule grants the obligations;
+        * priority / subject-priority: only the first matched rule in policy
+          order, the rule that actually decides the request;
+        * allow-and-deny: matched deny rules when a deny is present, otherwise
+          every matched allow rule.
+        """
+        effect_expr = self.model["e"][etype].value
+
+        if effect_expr in (PRIORITY_EFFECT, SUBJECT_PRIORITY_EFFECT):
+            return [matches[0]] if matches else []
+
+        allow_rules = [item for item in matches if item[0] == Effector.ALLOW]
+        deny_rules = [item for item in matches if item[0] == Effector.DENY]
+
+        if effect_expr == ALLOW_OVERRIDE_EFFECT:
+            return allow_rules
+
+        if effect_expr == DENY_OVERRIDE_EFFECT:
+            return deny_rules if deny_rules else allow_rules
+
+        if effect_expr == ALLOW_AND_DENY_EFFECT:
+            return deny_rules if deny_rules else allow_rules
+
+        # Unknown effect expression: be conservative and consider every
+        # matched rule rather than silently picking one.
+        return matches
 
     @staticmethod
     def configure_logging(logging_config=None):

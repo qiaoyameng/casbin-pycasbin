@@ -270,6 +270,61 @@ asyncio.run(main())
 
 4. Please refer to the ``tests`` files for more usage.
 
+## Structured decisions with obligations
+
+`enforce()` keeps returning a plain boolean. When a grant (or denial) carries
+requirements the application must fulfill — masking a field, recording an
+audit event, ... — use `decide()`, which returns a structured `Decision`.
+
+Obligations are plain data attached to policy rules as extra columns. The
+`obligation_definition` model section declares, for every obligation column,
+how values from the contributing rules are combined:
+
+* `union` — set union of all contributing values;
+* `intersection` — only values required by every contributing rule;
+* `consensus` — every contributing rule must require the same single value.
+
+```ini
+[policy_definition]
+p = sub, obj, act, audit, mask_fields, channel
+
+[policy_effect]
+e = some(where (p_eft == allow))
+
+[matchers]
+m = r.sub == p.sub && r.obj == p.obj && r.act == p.act
+
+[obligation_definition]
+o = audit = union, mask_fields = intersection, channel = consensus
+```
+
+Multiple values in one cell are separated with `|`.
+
+```python
+decision = e.decide("alice", "data1", "read")
+if decision.allowed:
+    for event in decision.obligations["audit"]:
+        record_event(event)          # the application performs the obligation
+elif decision.denied:
+    ...
+if not decision.executable:
+    # decision.conflicts describes the disagreeing obligations; this is an
+    # explicit unexecutable result, never a normal allow
+```
+
+Which matched rules are eligible to contribute is fixed by the effect model:
+
+* allow-override — every matched **allow** rule;
+* deny-override — every matched **deny** rule, or every matched allow rule when no deny matched;
+* priority / subject-priority — only the first matched rule (the one that decides);
+* allow-and-deny — matched deny rules when a deny is present, otherwise all matched allow rules.
+
+On a `consensus` disagreement the decision effect is `indeterminate`,
+`allowed`/`denied`/`executable` are all `False`, and `bool(decision)` raises
+`TypeError`, so an unexecutable result cannot be mistaken for an ordinary
+permission grant. The enforcer itself never sends audits or mutates business
+objects — the caller decides how to execute the returned obligations.
+
 ## Benchmarks
 
 https://casbin.apache.org/docs/benchmark/

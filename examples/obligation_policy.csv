@@ -1,0 +1,5 @@
+p, alice, data1, read, allow, login_event, id_card, secure_channel
+p, alice, data1, read, allow, read_event, id_card|phone, secure_channel
+p, bob, data2, write, allow, login_event,,
+p, carol, data1, read, allow, login_event, id_card, secure_channel
+p, carol, data1, read, deny, breach_event,,

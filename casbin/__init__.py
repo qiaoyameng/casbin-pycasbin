@@ -24,5 +24,6 @@ from .cache import Cache, DefaultCache
 from . import util
 from .persist import *
 from .effect import *
+from .decision import *
 from .model import *
 from .frontend import *

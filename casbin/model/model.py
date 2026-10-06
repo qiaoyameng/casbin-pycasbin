@@ -29,6 +29,7 @@ class Model(Policy):
         "g": "role_definition",
         "e": "policy_effect",
         "m": "matchers",
+        "o": "obligation_definition",
     }
 
     def _load_assertion(self, cfg, sec, key):
@@ -95,6 +96,7 @@ class Model(Policy):
         self._load_section(cfg, "p")
         self._load_section(cfg, "e")
         self._load_section(cfg, "m")
+        self._load_section(cfg, "o")
 
         self._load_section(cfg, "g")
 
@@ -105,6 +107,7 @@ class Model(Policy):
         self._load_section(cfg, "p")
         self._load_section(cfg, "e")
         self._load_section(cfg, "m")
+        self._load_section(cfg, "o")
 
         self._load_section(cfg, "g")
 
