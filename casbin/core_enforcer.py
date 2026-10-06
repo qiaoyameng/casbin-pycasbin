@@ -17,6 +17,7 @@ import logging
 import re
 
 from casbin.effect import Effector, get_effector, effect_to_bool
+from casbin.filter_compiler import compile_object_filter
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
@@ -389,6 +390,10 @@ class CoreEnforcer:
         """
         result, _ = self.enforce_ex(*rvals)
         return result
+
+    def compile_object_filter(self, user, action):
+        """Compiles an executable resource filter for a fixed subject and action."""
+        return compile_object_filter(self, user, action)
 
     def enforce_ex(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
