@@ -26,3 +26,4 @@ from .persist import *
 from .effect import *
 from .model import *
 from .frontend import *
+from .policy_batch import PolicyBatch, CommitResult, BatchValidationError

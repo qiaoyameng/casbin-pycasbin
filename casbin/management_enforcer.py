@@ -14,6 +14,7 @@
 
 from casbin.internal_enforcer import InternalEnforcer
 from casbin.model.policy_op import PolicyOp
+from casbin.policy_batch import PolicyBatch
 from casbin.constant.constants import ACTION_INDEX, SUBJECT_INDEX, OBJECT_INDEX
 
 
@@ -21,6 +22,20 @@ class ManagementEnforcer(InternalEnforcer):
     """
     ManagementEnforcer = InternalEnforcer + Management API.
     """
+
+    def new_policy_batch(self):
+        """begin a batch of p/g rule changes committed atomically.
+
+        Stage changes with ``add_policy``/``remove_policy``/``add_grouping_policy``
+        etc. on the returned :class:`PolicyBatch`, then call ``commit()``. Nothing
+        is visible to enforce calls until the whole batch has been validated,
+        persisted through an adapter transaction, and published.
+        """
+        return PolicyBatch(self)
+
+    def policy_batch(self):
+        """context-manager variant of :meth:`new_policy_batch`."""
+        return PolicyBatch(self)
 
     def get_all_subjects(self):
         """gets the list of subjects that show up in the current policy."""

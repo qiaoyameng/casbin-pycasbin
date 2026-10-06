@@ -41,6 +41,25 @@ class EnforceContext:
         return self.rtype, self.ptype, self.etype, self.mtype
 
 
+class PolicySnapshot:
+    """An immutable, consistent view of the policy used by one enforce call.
+
+    The model and the role managers in a snapshot are never mutated after
+    publication: a batch commit builds a brand-new view and swaps it in. An
+    enforce call captures the current snapshot on entry and keeps the same
+    reference until it returns, so it always evaluates against either the whole
+    old policy or the whole new one, including role relations.
+    """
+
+    __slots__ = ("version", "model", "rm_map", "cond_rm_map")
+
+    def __init__(self, version, model, rm_map, cond_rm_map):
+        self.version = version
+        self.model = model
+        self.rm_map = rm_map
+        self.cond_rm_map = cond_rm_map
+
+
 class CoreEnforcer:
     """CoreEnforcer defines the core functionality of an enforcer."""
 
@@ -107,12 +126,17 @@ class CoreEnforcer:
         # Do not initialize the full policy when using a filtered adapter
         if self.adapter and not self.is_filtered():
             self.load_policy()
+        else:
+            # no adapter: publish the empty/initial policy as the first view
+            self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
 
     def _initialize(self):
         self.rm_map = dict()
         self.cond_rm_map = dict()
         self.eft = get_effector(self.model["e"]["e"].value)
         self.watcher = None
+        self._snapshot = None
+        self._snapshot_version = 0
 
         self.enabled = True
         self.auto_save = True
@@ -222,7 +246,6 @@ class CoreEnforcer:
 
     def load_policy(self):
         """reloads the policy from file/database."""
-        need_to_rebuild = False
         new_model = copy.deepcopy(self.model)
         new_model.clear_policy()
 
@@ -236,24 +259,87 @@ class CoreEnforcer:
             new_model.print_policy()
 
             if self.auto_build_role_links:
-                need_to_rebuild = True
-                for rm in self.rm_map.values():
+                new_rm_map, new_cond_rm_map = self.clone_role_managers()
+                for rm in new_rm_map.values():
                     rm.clear()
-                if len(self.rm_map) != 0:
-                    new_model.build_role_links(self.rm_map)
+                if len(new_rm_map) != 0:
+                    new_model.build_role_links(new_rm_map)
 
-                for crm in self.cond_rm_map.values():
+                for crm in new_cond_rm_map.values():
                     crm.clear()
-                if len(self.cond_rm_map) != 0:
-                    new_model.build_conditional_role_links(self.cond_rm_map)
+                if len(new_cond_rm_map) != 0:
+                    new_model.build_conditional_role_links(new_cond_rm_map)
+            else:
+                # role-link rebuilding is disabled: reuse the current managers so
+                # links already present stay available, but publish them inside a
+                # fresh snapshot bound to the new model
+                new_rm_map, new_cond_rm_map = dict(self.rm_map), dict(self.cond_rm_map)
+                self._bind_role_managers(new_model, new_rm_map, new_cond_rm_map)
 
-            self.model = new_model
+            self.publish_snapshot(new_model, new_rm_map, new_cond_rm_map)
 
         except Exception as e:
-            if self.auto_build_role_links and need_to_rebuild:
-                self.build_role_links()
-
             raise e
+
+    def publish_snapshot(self, model, rm_map, cond_rm_map):
+        """atomically publish a fully-built view.
+
+        The model and role manager maps are replaced together. Old snapshots
+        stay intact for enforce calls already in flight; the reference swap is
+        atomic under the GIL and never serialises the whole enforce period.
+        """
+        self._snapshot_version += 1
+        self.model = model
+        self.rm_map = rm_map
+        self.cond_rm_map = cond_rm_map
+        self._snapshot = PolicySnapshot(self._snapshot_version, model, rm_map, cond_rm_map)
+
+    def current_snapshot(self):
+        """return the published view, publishing one from current state if none exists."""
+        if self._snapshot is None:
+            self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
+        return self._snapshot
+
+    def clone_role_managers(self, model=None):
+        """return fresh, independent role managers matching the current configuration.
+
+        Role graphs contain cycles and live matching functions, so they are
+        rebuilt as same-type instances rather than deep-copied.
+        When *model* is given, its g assertions are rebound to the cloned managers
+        (``build_role_links`` writes links through ``ast.rm``).
+        """
+        target_model = self.model if model is None else model
+        rm_map = {}
+        cond_rm_map = {}
+        for ptype, rm in self.rm_map.items():
+            clone = self._clone_one_role_manager(rm)
+            rm_map[ptype] = clone
+        for ptype, crm in self.cond_rm_map.items():
+            cond_rm_map[ptype] = self._clone_one_role_manager(crm)
+        self._bind_role_managers(target_model, rm_map, cond_rm_map)
+        return rm_map, cond_rm_map
+
+    @staticmethod
+    def _bind_role_managers(model, rm_map, cond_rm_map):
+        if "g" in model.keys():
+            for ptype, ast in model["g"].items():
+                if ptype in rm_map:
+                    ast.rm = rm_map[ptype]
+                if ptype in cond_rm_map:
+                    ast.cond_rm = cond_rm_map[ptype]
+
+    @staticmethod
+    def _clone_one_role_manager(rm):
+        max_level = getattr(rm, "max_hierarchy_level", 10)
+        clone = rm.__class__(max_level)
+        matching_func = getattr(rm, "matching_func", None)
+        if matching_func is not None:
+            clone.add_matching_func(matching_func)
+        domain_matching_func = getattr(rm, "domain_matching_func", None)
+        if domain_matching_func is not None:
+            clone.add_domain_matching_func(domain_matching_func)
+        return clone
+
 
     def load_filtered_policy(self, filter):
         """reloads a filtered policy from file/database."""
@@ -270,6 +356,7 @@ class CoreEnforcer:
         self.model.print_policy()
         if self.auto_build_role_links:
             self.build_role_links()
+        self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
 
     def load_increment_filtered_policy(self, filter):
         """LoadIncrementalFilteredPolicy append a filtered policy from file/database."""
@@ -280,6 +367,7 @@ class CoreEnforcer:
         self.model.print_policy()
         if self.auto_build_role_links:
             self.build_role_links()
+        self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
 
     def is_filtered(self):
         """returns true if the loaded policy has been filtered."""
@@ -395,6 +483,11 @@ class CoreEnforcer:
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
+        # Capture one complete view on entry. The whole request runs against this
+        # snapshot (rules and role links together); a concurrent batch commit
+        # publishes a different snapshot and cannot make this request see a mix.
+        snapshot = self.current_snapshot()
+        view_model = snapshot.model
 
         rtype = "r"
         ptype = "p"
@@ -404,13 +497,17 @@ class CoreEnforcer:
         if not self.enabled:
             return [True, []]
 
-        functions = self.fm.get_functions()
+        # Copy the function table: it is shared mutable state, and a later
+        # enforce call rebuilds the g() closures against its own snapshot. Without
+        # the copy that rebuild would overwrite the g this request is mid-way
+        # through using, re-mixing new role links into an old view.
+        functions = dict(self.fm.get_functions())
 
-        if "g" in self.model.keys():
-            for key, ast in self.model["g"].items():
-                if len(self.rm_map) != 0:
-                    functions[key] = generate_g_function(ast.rm)
-                if len(self.cond_rm_map) != 0:
+        if "g" in view_model.keys():
+            for key, ast in view_model["g"].items():
+                if len(snapshot.rm_map) != 0:
+                    functions[key] = generate_g_function(snapshot.rm_map[key])
+                if len(snapshot.cond_rm_map) != 0:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
 
         if len(rvals) != 0:
@@ -422,19 +519,19 @@ class CoreEnforcer:
                 mtype = enforce_context.mtype
                 rvals = rvals[1:]
 
-        if "m" not in self.model.keys():
+        if "m" not in view_model.keys():
             raise RuntimeError("model is undefined")
 
-        if "m" not in self.model["m"].keys():
+        if "m" not in view_model["m"].keys():
             raise RuntimeError("model is undefined")
 
-        r_tokens = self.model["r"][rtype].tokens
-        p_tokens = self.model["p"][ptype].tokens
+        r_tokens = view_model["r"][rtype].tokens
+        p_tokens = view_model["p"][ptype].tokens
 
         if len(r_tokens) != len(rvals):
             raise RuntimeError("invalid request size")
 
-        exp_string = self.model["m"][mtype].value
+        exp_string = view_model["m"][mtype].value
         exp_has_eval = util.has_eval(exp_string)
         if not exp_has_eval:
             expression = self._get_expression(exp_string, functions)
@@ -443,11 +540,12 @@ class CoreEnforcer:
 
         r_parameters = dict(zip(r_tokens, rvals))
 
-        policy_len = len(self.model["p"][ptype].policy)
+        policy = view_model["p"][ptype].policy
+        policy_len = len(policy)
 
         explain_index = -1
         if not 0 == policy_len:
-            for i, pvals in enumerate(self.model["p"][ptype].policy):
+            for i, pvals in enumerate(policy):
                 if len(p_tokens) != len(pvals):
                     raise RuntimeError("invalid policy size")
 
@@ -498,7 +596,7 @@ class CoreEnforcer:
 
             parameters = r_parameters.copy()
 
-            for token in self.model["p"][ptype].tokens:
+            for token in view_model["p"][ptype].tokens:
                 parameters[token] = ""
 
             result = expression.eval(parameters)
@@ -527,7 +625,7 @@ class CoreEnforcer:
 
         explain_rule = []
         if explain_index != -1 and explain_index < policy_len:
-            explain_rule = self.model["p"][ptype].policy[explain_index]
+            explain_rule = policy[explain_index]
 
         return result, explain_rule
 

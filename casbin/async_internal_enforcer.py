@@ -43,9 +43,11 @@ class AsyncInternalEnforcer(CoreEnforcer):
 
         self._initialize()
 
+        if self.adapter is None:
+            self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
+
     async def load_policy(self):
         """async reloads the policy from file/database."""
-        need_to_rebuild = False
         new_model = copy.deepcopy(self.model)
         new_model.clear_policy()
 
@@ -59,23 +61,23 @@ class AsyncInternalEnforcer(CoreEnforcer):
             new_model.print_policy()
 
             if self.auto_build_role_links:
-                need_to_rebuild = True
-                for rm in self.rm_map.values():
+                new_rm_map, new_cond_rm_map = self.clone_role_managers()
+                for rm in new_rm_map.values():
                     rm.clear()
-                if len(self.rm_map) != 0:
-                    new_model.build_role_links(self.rm_map)
+                if len(new_rm_map) != 0:
+                    new_model.build_role_links(new_rm_map)
 
-                for crm in self.cond_rm_map.values():
+                for crm in new_cond_rm_map.values():
                     crm.clear()
-                if len(self.cond_rm_map) != 0:
-                    new_model.build_conditional_role_links(self.cond_rm_map)
+                if len(new_cond_rm_map) != 0:
+                    new_model.build_conditional_role_links(new_cond_rm_map)
+            else:
+                new_rm_map, new_cond_rm_map = dict(self.rm_map), dict(self.cond_rm_map)
+                self._bind_role_managers(new_model, new_rm_map, new_cond_rm_map)
 
-            self.model = new_model
+            self.publish_snapshot(new_model, new_rm_map, new_cond_rm_map)
 
         except Exception as e:
-            if self.auto_build_role_links and need_to_rebuild:
-                self.build_role_links()
-
             raise e
 
     async def load_filtered_policy(self, filter):
@@ -93,6 +95,7 @@ class AsyncInternalEnforcer(CoreEnforcer):
         self.model.print_policy()
         if self.auto_build_role_links:
             self.build_role_links()
+        self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
 
     async def load_increment_filtered_policy(self, filter):
         """async append a filtered policy from file/database."""
@@ -103,6 +106,7 @@ class AsyncInternalEnforcer(CoreEnforcer):
         self.model.print_policy()
         if self.auto_build_role_links:
             self.build_role_links()
+        self.publish_snapshot(self.model, self.rm_map, self.cond_rm_map)
 
     async def save_policy(self):
         if self.is_filtered():
