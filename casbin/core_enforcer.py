@@ -15,13 +15,21 @@
 import copy
 import logging
 import re
+import uuid
 
 from casbin.effect import Effector, get_effector, effect_to_bool
 from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
-from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
+from casbin.session import Session, SessionError, RoleActivationConstraint
+from casbin.util import (
+    generate_g_function,
+    generate_session_g_function,
+    SimpleEval,
+    util,
+    generate_conditional_g_function,
+)
 from casbin.util.log import configure_logging, disabled_logging
 
 
@@ -113,6 +121,8 @@ class CoreEnforcer:
         self.cond_rm_map = dict()
         self.eft = get_effector(self.model["e"]["e"].value)
         self.watcher = None
+        self._sessions = dict()
+        self._dsd_constraints = dict()
 
         self.enabled = True
         self.auto_save = True
@@ -383,6 +393,152 @@ class CoreEnforcer:
             mtype="m" + suffix,
         )
 
+    def create_session(self, user, domain=None):
+        """creates a session for a user, optionally bound to a domain.
+
+        Roles must be explicitly activated in the session before they can be
+        used by enforce_with_session(); sessions are independent of each other.
+        """
+        session = Session(str(uuid.uuid4()), user, domain)
+        self._sessions[session.id] = session
+        return session
+
+    def drop_session(self, session):
+        """drops a session; it can no longer be used for activation or enforcement."""
+        self._check_session(session)
+        del self._sessions[session.id]
+        return True
+
+    def get_session(self, session_id):
+        """gets a live session by id, or None if it does not exist."""
+        return self._sessions.get(session_id)
+
+    def _check_session(self, session):
+        if not isinstance(session, Session) or self._sessions.get(session.id) is not session:
+            raise SessionError("unknown or dropped session")
+
+    def _user_owns_role(self, user, role, domain):
+        """determines whether a user is directly assigned a role in a domain."""
+        rm = self.rm_map.get("g")
+        if rm is None:
+            return False
+        if domain is None:
+            return role in rm.get_roles(user)
+        return role in rm.get_roles(user, domain)
+
+    def _role_touches_constraint(self, role, constraint, domain):
+        """determines whether a role belongs to a DSD constraint's role set,
+        taking role inheritance into account: a role that (transitively)
+        inherits any member of the set is also constrained.
+        """
+        rm = self.rm_map.get("g")
+        for target in constraint.roles:
+            if role == target:
+                return True
+            if rm is None:
+                continue
+            if domain is None:
+                if rm.has_link(role, target):
+                    return True
+            elif rm.has_link(role, target, domain):
+                return True
+        return False
+
+    def activate_role(self, session, role):
+        """activates a role in a session.
+
+        The role must be one the session's user actually owns in the session's
+        domain, and the activation must not violate any dynamic
+        separation-of-duty constraint. Returns false if the role was already
+        activated; raises SessionError otherwise.
+        """
+        self._check_session(session)
+        if role in session.activated_roles:
+            return False
+        if not self._user_owns_role(session.user, role, session.domain):
+            raise SessionError(
+                "cannot activate role {!r}: user {!r} does not own it in domain {!r}".format(
+                    role, session.user, session.domain
+                )
+            )
+        for constraint in self._dsd_constraints.values():
+            if not self._role_touches_constraint(role, constraint, session.domain):
+                continue
+            touched = [
+                active
+                for active in session.activated_roles
+                if self._role_touches_constraint(active, constraint, session.domain)
+            ]
+            if len(touched) + 1 > constraint.max_active:
+                raise SessionError(
+                    "cannot activate role {!r}: DSD constraint {} allows at most {} of {} in one session".format(
+                        role, constraint.id, constraint.max_active, sorted(constraint.roles)
+                    )
+                )
+        session.activated_roles.add(role)
+        return True
+
+    def deactivate_role(self, session, role):
+        """deactivates a role in a session.
+        Returns false if the role was not activated (aka not affected).
+        """
+        self._check_session(session)
+        if role not in session.activated_roles:
+            return False
+        session.activated_roles.discard(role)
+        return True
+
+    def get_activated_roles(self, session):
+        """gets the roles currently activated in a session."""
+        self._check_session(session)
+        return sorted(session.activated_roles)
+
+    def add_dsd_constraint(self, roles, max_active):
+        """adds a dynamic separation-of-duty constraint:
+        at most `max_active` roles of the given set (including roles that
+        inherit any of them) may be activated in a single session.
+        Returns the constraint id.
+        """
+        constraint = RoleActivationConstraint(roles, max_active)
+        self._dsd_constraints[constraint.id] = constraint
+        return constraint.id
+
+    def remove_dsd_constraint(self, constraint_id):
+        """removes a DSD constraint.
+        Returns false if the constraint does not exist (aka not affected).
+        """
+        if constraint_id not in self._dsd_constraints:
+            return False
+        del self._dsd_constraints[constraint_id]
+        return True
+
+    def get_dsd_constraints(self):
+        """gets all dynamic separation-of-duty constraints."""
+        return list(self._dsd_constraints.values())
+
+    def _valid_activated_roles(self, session):
+        """the session's activated roles that are still backed by a current
+        user assignment; revoked assignments stop granting permissions even if
+        the role is still marked activated in the session.
+        """
+        return [
+            role
+            for role in session.activated_roles
+            if self._user_owns_role(session.user, role, session.domain)
+        ]
+
+    def enforce_with_session(self, session, *rvals):
+        """decides whether a request is allowed in the context of a session.
+
+        The g relation for the session's user starts from the session's
+        activated roles (validated against current assignments) instead of the
+        user's full role assignments. Requests for other subjects are
+        unaffected.
+        """
+        self._check_session(session)
+        result, _ = self.enforce_ex(*rvals, session=session)
+        return result
+
     def enforce(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
@@ -390,7 +546,7 @@ class CoreEnforcer:
         result, _ = self.enforce_ex(*rvals)
         return result
 
-    def enforce_ex(self, *rvals):
+    def enforce_ex(self, *rvals, session=None):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
         return judge result with reason
@@ -409,7 +565,12 @@ class CoreEnforcer:
         if "g" in self.model.keys():
             for key, ast in self.model["g"].items():
                 if len(self.rm_map) != 0:
-                    functions[key] = generate_g_function(ast.rm)
+                    if session is not None:
+                        functions[key] = generate_session_g_function(
+                            ast.rm, session.user, session.domain, self._valid_activated_roles(session)
+                        )
+                    else:
+                        functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
 

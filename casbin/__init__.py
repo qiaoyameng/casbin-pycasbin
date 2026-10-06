@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .enforcer import *
+from .session import Session, SessionError, RoleActivationConstraint
 from .synced_enforcer import SyncedEnforcer
 from .distributed_enforcer import DistributedEnforcer
 from .fast_enforcer import FastEnforcer

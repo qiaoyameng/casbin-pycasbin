@@ -366,6 +366,50 @@ def generate_g_function(rm):
     return f
 
 
+def generate_session_g_function(rm, user, domain, activated_roles):
+    """the factory method of the g(_, _[, _]) function scoped to a session.
+
+    For the session's user, the g relation starts from the session's
+    activated roles instead of the user's full assignments. Every other
+    subject keeps the default role manager behavior.
+    """
+
+    def f(*args):
+        name1 = args[0]
+        name2 = args[1]
+        req_domain = str(args[2]) if len(args) > 2 else None
+
+        if name1 != user:
+            if not rm:
+                return name1 == name2
+            if req_domain is None:
+                return rm.has_link(name1, name2)
+            return rm.has_link(name1, name2, req_domain)
+
+        # the session subject: identity always holds
+        if name1 == name2:
+            return True
+
+        # activated roles only apply inside the session's domain
+        if domain is not None and req_domain != domain:
+            return False
+
+        for role in activated_roles:
+            if role == name2:
+                return True
+            if not rm:
+                continue
+            if req_domain is None:
+                if rm.has_link(role, name2):
+                    return True
+            elif rm.has_link(role, name2, req_domain):
+                return True
+
+        return False
+
+    return f
+
+
 def generate_conditional_g_function(crm):
     """the factory method of the g(_, _[, _]) function with conditions."""
 
