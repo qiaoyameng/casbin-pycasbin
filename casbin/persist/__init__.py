@@ -16,3 +16,10 @@ from .adapter import *
 from .adapter_filtered import *
 from .adapters import *
 from .batch_adapter import *
+from .errors import (
+    CasbinError,
+    TransactionNotSupportedError,
+    TransactionCommitError,
+    PolicyNotificationError,
+)
+from .transaction_adapter import TransactionalAdapter, Transaction

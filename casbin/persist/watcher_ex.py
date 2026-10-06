@@ -62,3 +62,11 @@ class WatcherEx(Watcher):
         It is called after Enforcer.RemovePolicies()
         """
         pass
+
+    def update_for_batch_update(self, operations: list):
+        """
+        update_for_batch_update calls the update callback exactly once after a
+        whole batch of rules has been committed and published. ``operations`` is
+        the list of committed (op, sec, ptype, rules) tuples.
+        """
+        pass

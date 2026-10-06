@@ -141,6 +141,38 @@ class _DeferredWatcher:
         return deferred
 
 
+class _SyncedBatchUpdate:
+    """routes a BatchUpdate through the SyncedEnforcer write lock on commit."""
+
+    def __init__(self, synced):
+        self._synced = synced
+        self._batch = synced._e.batch_update()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            self._batch.rollback()
+            return False
+        with self._synced._wl:
+            self._batch.commit()
+        return False
+
+    def __getattr__(self, name):
+        attr = getattr(self._batch, name)
+        if name == "commit":
+            synced = self._synced
+
+            def locked_commit(*args, **kwargs):
+                with synced._wl:
+                    return attr(*args, **kwargs)
+
+            return locked_commit
+        return attr
+
+
+
 class SyncedEnforcer:
     """SyncedEnforcer wraps Enforcer and provides synchronized access.
     It's also a drop-in replacement for Enforcer"""
@@ -722,6 +754,17 @@ class SyncedEnforcer:
         """
         with self._wl:
             return self._e.add_policies(rules)
+
+    def batch_update(self):
+        """stages a transactional batch of policy/grouping changes.
+
+        The batch is staged freely; commit runs under the enforcer write
+        lock. In-flight enforces keep their own immutable view and are not
+        blocked.
+        """
+        return _SyncedBatchUpdate(self)
+
+
 
     def add_policies_ex(self, rules):
         """add_policies_ex adds authorization rules to the current policy.

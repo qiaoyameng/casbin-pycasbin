@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from casbin.internal_enforcer import InternalEnforcer
+from casbin.batch import BatchUpdate
 from casbin.model.policy_op import PolicyOp
 from casbin.constant.constants import ACTION_INDEX, SUBJECT_INDEX, OBJECT_INDEX
 
@@ -21,6 +22,15 @@ class ManagementEnforcer(InternalEnforcer):
     """
     ManagementEnforcer = InternalEnforcer + Management API.
     """
+
+    def batch_update(self):
+        """returns a transactional batch of policy/grouping rule changes.
+
+        Stage changes on the returned :class:`BatchUpdate` and commit them
+        together; other requests keep seeing the old policy view until the
+        whole batch is committed and published.
+        """
+        return BatchUpdate(self)
 
     def get_all_subjects(self):
         """gets the list of subjects that show up in the current policy."""
