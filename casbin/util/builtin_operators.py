@@ -366,6 +366,48 @@ def generate_g_function(rm):
     return f
 
 
+def generate_session_g_function(rm, session):
+    """the factory method of the session-scoped g(_, _[, _]) function.
+
+    For the session's user (in the session's domain), role links are resolved
+    from the session's activated roles instead of the user's full assignments.
+    An activated role is only honored while the user still owns it, so
+    revoking an assignment takes effect on existing sessions immediately.
+    Every other subject (or domain) uses the role manager as usual.
+    """
+
+    def f(*args):
+        name1 = args[0]
+        name2 = args[1]
+
+        if name1 == name2:
+            return True
+
+        if not rm:
+            return False
+
+        if 2 == len(args):
+            if session.domain is None and name1 == session.user:
+                return _has_activated_link(rm, session, name2)
+            return rm.has_link(name1, name2)
+
+        domain = str(args[2])
+        if session.domain == domain and name1 == session.user:
+            return _has_activated_link(rm, session, name2, domain)
+
+        return rm.has_link(name1, name2, domain)
+
+    return f
+
+
+def _has_activated_link(rm, session, name2, *domain):
+    for role in session.get_activated_roles():
+        if rm.has_link(session.user, role, *domain) and rm.has_link(role, name2, *domain):
+            return True
+
+    return False
+
+
 def generate_conditional_g_function(crm):
     """the factory method of the g(_, _[, _]) function with conditions."""
 

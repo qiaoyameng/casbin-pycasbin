@@ -21,7 +21,14 @@ from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
-from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
+from casbin.session import DSDConstraint, Session, SessionError
+from casbin.util import (
+    generate_g_function,
+    generate_session_g_function,
+    SimpleEval,
+    util,
+    generate_conditional_g_function,
+)
 from casbin.util.log import configure_logging, disabled_logging
 
 
@@ -58,6 +65,9 @@ class CoreEnforcer:
     auto_save = False
     auto_build_role_links = False
     auto_notify_watcher = False
+
+    sessions = None
+    dsd_constraints = None
 
     def __init__(self, model=None, adapter=None, enable_log=False, logging_config: dict = None):
         self.logger = logging.getLogger("casbin.enforcer")
@@ -118,6 +128,10 @@ class CoreEnforcer:
         self.auto_save = True
         self.auto_build_role_links = True
         self.auto_notify_watcher = True
+
+        self.sessions = dict()
+        self.dsd_constraints = []
+        self._session_id_counter = 0
 
         self.init_rm_map()
 
@@ -383,6 +397,105 @@ class CoreEnforcer:
             mtype="m" + suffix,
         )
 
+    def create_session(self, user, domain=None):
+        """creates a session for user in domain (domain may be omitted for
+        domain-less models). Roles are activated on the returned session with
+        session.activate_role(); enforcement through the session is done with
+        enforce_with_session()."""
+        self._session_id_counter += 1
+        session = Session(self, "session-{}".format(self._session_id_counter), user, domain)
+        self.sessions[session.id] = session
+        return session
+
+    def get_session(self, session_id):
+        """gets an open session by id, or None if it does not exist."""
+        return self.sessions.get(session_id)
+
+    def close_session(self, session):
+        """closes a session (a Session instance or a session id).
+        Returns true if an open session was closed."""
+        session_id = session.id if isinstance(session, Session) else session
+        existing = self.sessions.get(session_id)
+        if existing is None:
+            return False
+
+        existing._is_open = False
+        del self.sessions[session_id]
+        return True
+
+    def add_dsd_constraint(self, roles, max_active):
+        """adds a dynamic separation-of-duty constraint: within a single
+        session, at most max_active roles out of roles may be activated.
+        Role inheritance is honored when checking the constraint."""
+        constraint = DSDConstraint(roles, max_active)
+        self.dsd_constraints.append(constraint)
+        return constraint
+
+    def get_dsd_constraints(self):
+        """gets the registered dynamic separation-of-duty constraints."""
+        return list(self.dsd_constraints)
+
+    def _check_session(self, session):
+        if not isinstance(session, Session):
+            raise SessionError("invalid session")
+        if session._enforcer is not self:
+            raise SessionError("session {!r} belongs to a different enforcer".format(session.id))
+        if not session.is_open or self.sessions.get(session.id) is not session:
+            raise SessionError("session {!r} is closed".format(session.id))
+
+    def _activate_role(self, session, role):
+        self._check_session(session)
+
+        rm = self.rm_map.get("g")
+        if rm is None:
+            raise SessionError("cannot activate roles: model has no role definition 'g'")
+
+        domain_args = (session.domain,) if session.domain is not None else ()
+        if not rm.has_link(session.user, role, *domain_args):
+            raise SessionError(
+                "user {!r} does not own role {!r} in domain {!r}".format(session.user, role, session.domain)
+            )
+
+        if role in session._activated_roles:
+            return
+
+        self._check_dsd_constraints(session, role, rm, domain_args)
+        session._activated_roles.append(role)
+
+    def _deactivate_role(self, session, role):
+        self._check_session(session)
+        if role in session._activated_roles:
+            session._activated_roles.remove(role)
+
+    def _check_dsd_constraints(self, session, role, rm, domain_args):
+        activated = session.get_activated_roles() + [role]
+        for constraint in self.dsd_constraints:
+            covered = set()
+            for constrained_role in constraint.roles:
+                if any(rm.has_link(active, constrained_role, *domain_args) for active in activated):
+                    covered.add(constrained_role)
+
+            if len(covered) > constraint.max_active:
+                raise SessionError(
+                    "activating role {!r} violates DSD constraint {}: "
+                    "session {!r} would cover {} of the constrained roles".format(
+                        role, constraint, session.id, sorted(covered)
+                    )
+                )
+
+    def enforce_with_session(self, session, *rvals):
+        """same as enforce(), but the g relation for the session's user (in
+        the session's domain) is resolved from the session's activated roles
+        only. Session-less enforce() semantics are unchanged."""
+        result, _ = self.enforce_ex_with_session(session, *rvals)
+        return result
+
+    def enforce_ex_with_session(self, session, *rvals):
+        """same as enforce_ex(), but scoped to a session like
+        enforce_with_session()."""
+        self._check_session(session)
+        return self._enforce_ex(session, *rvals)
+
     def enforce(self, *rvals):
         """decides whether a "subject" can access a "object" with the operation "action",
         input parameters are usually: (sub, obj, act).
@@ -395,6 +508,9 @@ class CoreEnforcer:
         input parameters are usually: (sub, obj, act).
         return judge result with reason
         """
+        return self._enforce_ex(None, *rvals)
+
+    def _enforce_ex(self, session, *rvals):
 
         rtype = "r"
         ptype = "p"
@@ -409,7 +525,10 @@ class CoreEnforcer:
         if "g" in self.model.keys():
             for key, ast in self.model["g"].items():
                 if len(self.rm_map) != 0:
-                    functions[key] = generate_g_function(ast.rm)
+                    if session is not None:
+                        functions[key] = generate_session_g_function(ast.rm, session)
+                    else:
+                        functions[key] = generate_g_function(ast.rm)
                 if len(self.cond_rm_map) != 0:
                     functions[key] = generate_conditional_g_function(ast.cond_rm)
 
