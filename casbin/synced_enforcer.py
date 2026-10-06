@@ -709,6 +709,38 @@ class SyncedEnforcer:
         with self._wl:
             self._e.set_named_link_condition_func_params(ptype, user, role, *params)
 
+    def add_named_link_validity_interval(self, ptype, user, role, start, end):
+        """attaches a half-open validity interval [start, end) to the role
+        inheritance link user->role of the named grouping policy ptype."""
+        with self._wl:
+            return self._e.add_named_link_validity_interval(ptype, user, role, start, end)
+
+    def remove_named_link_validity_interval(self, ptype, user, role):
+        """removes the validity interval attached to the link user->role, if any."""
+        with self._wl:
+            return self._e.remove_named_link_validity_interval(ptype, user, role)
+
+    def add_named_policy_validity_interval(self, ptype, rule, start, end):
+        """attaches a half-open validity interval [start, end) to a policy rule."""
+        with self._wl:
+            return self._e.add_named_policy_validity_interval(ptype, rule, start, end)
+
+    def remove_named_policy_validity_interval(self, ptype, rule):
+        """removes the validity interval attached to a policy rule, if any."""
+        with self._wl:
+            return self._e.remove_named_policy_validity_interval(ptype, rule)
+
+    def get_allowed_intervals(self, window_start, window_end, *rvals):
+        """returns the sorted, non-overlapping half-open intervals inside
+        [window_start, window_end) during which the request is allowed."""
+        with self._rl:
+            return self._e.get_allowed_intervals(window_start, window_end, *rvals)
+
+    def is_allowed_at(self, moment, *rvals):
+        """decides whether the request is allowed at one absolute moment."""
+        with self._rl:
+            return self._e.is_allowed_at(moment, *rvals)
+
     def is_filtered(self):
         """returns true if the loaded policy has been filtered."""
         with self._rl:

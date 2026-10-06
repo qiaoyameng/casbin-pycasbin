@@ -211,6 +211,39 @@ https://casbin.apache.org/docs/adapters/
 
 https://casbin.apache.org/docs/role-managers/
 
+## Time-window authorization queries
+
+Besides asking whether a request is allowed right now, you can ask *when* it is
+allowed inside a query window. Attach half-open validity intervals `[start, end)`
+to role inheritance links and policy rules, then query the exact allowed
+intervals. All times are timezone-aware absolute moments; the machine clock is
+never read.
+
+```python
+from datetime import datetime, timezone
+
+e.add_named_link_validity_interval("g", "alice", "admin",
+                                   datetime(2026, 10, 12, tzinfo=timezone.utc),
+                                   datetime(2026, 10, 14, tzinfo=timezone.utc))
+e.add_named_policy_validity_interval("p", ("admin", "data1", "read", "allow"),
+                                     datetime(2026, 10, 12, tzinfo=timezone.utc),
+                                     datetime(2026, 10, 19, tzinfo=timezone.utc))
+
+# sorted, non-overlapping half-open intervals inside the window
+e.get_allowed_intervals(datetime(2026, 10, 12, tzinfo=timezone.utc),
+                        datetime(2026, 10, 19, tzinfo=timezone.utc),
+                        "alice", "data1", "read")
+
+# point-in-time counterpart at one absolute moment
+e.is_allowed_at(datetime(2026, 10, 13, tzinfo=timezone.utc), "alice", "data1", "read")
+```
+
+Along one inheritance path all links must be valid at the same time, while
+alternative paths chain after each other; the result follows the model's
+allow/deny policy effect. Custom time functions (link condition functions,
+`timeMatch`, `eval()` or user-registered matcher functions) cannot be evaluated
+over a window, so interval queries reject models that use them.
+
 ## Async Enforcer
 
 If your code uses `async` / `await` and is heavily dependent on I/O operations, you can adopt Async Enforcer!

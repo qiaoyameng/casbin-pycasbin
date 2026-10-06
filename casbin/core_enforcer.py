@@ -21,8 +21,10 @@ from casbin.model import Model, FunctionMap
 from casbin.persist import Adapter
 from casbin.persist.adapters import FileAdapter
 from casbin.rbac import default_role_manager
+from casbin import temporal
 from casbin.util import generate_g_function, SimpleEval, util, generate_conditional_g_function
 from casbin.util.log import configure_logging, disabled_logging
+from casbin.util.temporal import validate_interval
 
 
 class EnforceContext:
@@ -118,6 +120,9 @@ class CoreEnforcer:
         self.auto_save = True
         self.auto_build_role_links = True
         self.auto_notify_watcher = True
+
+        self.link_validity_intervals = dict()
+        self.policy_validity_intervals = dict()
 
         self.init_rm_map()
 
@@ -374,6 +379,55 @@ class CoreEnforcer:
             rm.set_domain_link_condition_func_params(user, role, domain, *params)
             return True
         return False
+
+    def add_named_link_validity_interval(self, ptype, user, role, start, end):
+        """attaches a half-open validity interval [start, end) to the role
+        inheritance link user->role of the named grouping policy ptype.
+
+        start and end must be timezone-aware absolute times; a zero-length
+        interval (start == end) is never valid.  The interval is honored by
+        get_allowed_intervals() and is_allowed_at().
+        """
+        self.link_validity_intervals[(ptype, user, role)] = validate_interval(start, end)
+        return True
+
+    def remove_named_link_validity_interval(self, ptype, user, role):
+        """removes the validity interval attached to the link user->role, if any."""
+        return self.link_validity_intervals.pop((ptype, user, role), None) is not None
+
+    def add_named_policy_validity_interval(self, ptype, rule, start, end):
+        """attaches a half-open validity interval [start, end) to a policy rule.
+
+        rule identifies the policy rule exactly as it was added (for example
+        ["alice", "data1", "read", "allow"]); start and end must be
+        timezone-aware absolute times.  The interval is honored by
+        get_allowed_intervals() and is_allowed_at().
+        """
+        self.policy_validity_intervals[(ptype, tuple(rule))] = validate_interval(start, end)
+        return True
+
+    def remove_named_policy_validity_interval(self, ptype, rule):
+        """removes the validity interval attached to a policy rule, if any."""
+        return self.policy_validity_intervals.pop((ptype, tuple(rule)), None) is not None
+
+    def get_allowed_intervals(self, window_start, window_end, *rvals):
+        """returns the sorted, non-overlapping half-open intervals inside
+        [window_start, window_end) during which the request is allowed.
+
+        Both bounds must be timezone-aware absolute times; the machine's
+        current time is never read.  The result is computed exactly from the
+        validity intervals attached to role links and policy rules and
+        follows the model's allow/deny policy effect.
+        """
+        return temporal.get_allowed_intervals(self, window_start, window_end, *rvals)
+
+    def is_allowed_at(self, moment, *rvals):
+        """decides whether the request is allowed at one absolute moment.
+
+        moment must be a timezone-aware absolute time; the machine's current
+        time is never read.
+        """
+        return temporal.is_allowed_at(self, moment, *rvals)
 
     def new_enforce_context(self, suffix: str) -> EnforceContext:
         return EnforceContext(
