@@ -211,6 +211,52 @@ https://casbin.apache.org/docs/adapters/
 
 https://casbin.apache.org/docs/role-managers/
 
+## Relationship tuples (ReBAC)
+
+`casbin.relationship` expresses Google Zanzibar / Google Drive style
+relationships between documents, folders and teams. A `Schema` defines how
+each relation on an object type is derived from direct members, usersets on
+other objects, and union / intersection / difference of them:
+
+```python
+from casbin.relationship import (
+    RelationshipEnforcer, Schema, direct, computed, tuple_userset, union,
+)
+
+schema = Schema({
+    "folder": {
+        "parent": direct(),
+        "viewer": union([direct(), tuple_userset("parent", "viewer")]),
+    },
+    "document": {
+        "parent": direct(),
+        "blocked": direct(),
+        # direct shares + parent folder viewers, minus blocked users
+        "viewer": union([direct(), tuple_userset("parent", "viewer")])
+                  .subtract(computed("blocked")),
+    },
+    "team": {"member": union([direct(), tuple_userset("member", "member")])},
+})
+
+enforcer = RelationshipEnforcer(schema)
+enforcer.add_tuple("folder:home#viewer@alice")
+enforcer.add_tuple("document:design.doc#parent@folder:home")
+
+enforcer.enforce("alice", "document", "design.doc", "viewer")  # True
+```
+
+Subjects distinguish user identities (`"alice"`), objects (`"folder:home"`)
+and usersets (`"team:eng#member"`). Usersets are evaluated to a least
+fixpoint over the finite, in-memory tuples, so positive recursion (parent
+folders, teams containing teams, diamond inheritance) is supported. A
+recursion that returns to itself through a difference (subtraction) branch
+has no fixpoint and is rejected when the schema is built -- or, for edges
+whose target type comes from tuple data, with an error at evaluation time;
+it is never silently truncated to `false`. Only the tuples you add are used;
+there is no external permission service.
+
+See `examples/relationship_example.py`.
+
 ## Async Enforcer
 
 If your code uses `async` / `await` and is heavily dependent on I/O operations, you can adopt Async Enforcer!
