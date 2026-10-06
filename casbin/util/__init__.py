@@ -14,4 +14,5 @@
 
 from .builtin_operators import *
 from .expression import *
+from .role_inducer import *
 from .util import *
