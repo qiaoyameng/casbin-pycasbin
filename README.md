@@ -274,6 +274,49 @@ asyncio.run(main())
 
 https://casbin.apache.org/docs/benchmark/
 
+## Relation tuples (Zanzibar-style usersets)
+
+`casbin.relations` is an in-memory, tuple-based relation model: subjects can be
+direct users, another object's userset (`folder:root#viewer`), and relation
+definitions combine usersets with union, intersection and difference.
+
+```python
+from casbin.relations import (
+    ComputedUserset, Difference, RelationModel, RelationSpec, This,
+    TupleStore, TupleToUserset, Union, direct_users, object_of,
+    new_relation_enforcer, userset_of,
+)
+
+model = RelationModel([
+    RelationSpec("folder", "viewer",
+                 Union(This(), TupleToUserset("parent", "viewer")),
+                 (direct_users(), userset_of("folder", "viewer"))),
+    RelationSpec("folder", "parent", This(), (object_of("folder"),)),
+    RelationSpec("document", "parent", This(), (object_of("folder"),)),
+    RelationSpec("document", "blocked", This(), (direct_users(),)),
+    RelationSpec("document", "viewer",
+                 Difference(Union(This(), TupleToUserset("parent", "viewer")),
+                            ComputedUserset("blocked")),
+                 (direct_users(), userset_of("folder", "viewer"))),
+])
+
+store = TupleStore(model=model)
+store.add("folder:root#viewer@user:alice")
+store.add("document:plan#parent@folder:root")
+store.add("document:plan#blocked@user:alice")
+
+enforcer = new_relation_enforcer(model, store)
+enforcer.enforce("alice", "document:plan", "view")  # False: blocked overrides inheritance
+```
+
+Positive recursion (e.g. nested/cyclic teams) is allowed and evaluated to a
+least fixed point over the finite in-memory data. Recursion returning to a
+relation through a difference operand is rejected with `RelationModelError`
+when the model is built -- it is never truncated to `false` at access time.
+Object types, relation names and user identities are distinct typed values.
+Only tuples supplied by the caller are used; no external permission service is
+contacted.
+
 ## Logging
 
 pycasbin leverages the default Python logging mechanism. The pycasbin package makes a call to `logging.getLogger()` to set the logger. No special logging configuration is needed other than initializing the logger in the parent application. If no logging is initialized within the parent application, you will not see any log messages from pycasbin. At the same time, when you enable log in pycasbin, you can specify the logging configuration through the parameter `logging_config`. If no configuration is specified, it will use the [default log configuration](https://github.com/apache/casbin-pycasbin/blob/c33cabfa0ac65cd09cf812a65e71794d64cb5132/casbin/util/log.py#L6C1-L6C1). For other pycasbin extensions, you can refer to the [Django logging docs](https://docs.djangoproject.com/en/4.2/topics/logging/) if you are a Django user. For other Python users, you should refer to the [Python logging docs](https://docs.python.org/3/library/logging.config.html) to configure the logger.
