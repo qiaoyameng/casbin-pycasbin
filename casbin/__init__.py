@@ -26,3 +26,11 @@ from .persist import *
 from .effect import *
 from .model import *
 from .frontend import *
+from .restricted_management import (
+    AdminScope,
+    PolicyChange,
+    ScopedPolicyManager,
+    ScopeViolationError,
+    UnsupportedModelError,
+    apply_scoped_changes,
+)
